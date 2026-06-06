@@ -133,7 +133,7 @@ def identify_rsi_levels(df,options_levels, prominence=10, distance=5, tolerance=
         default=""
     )
 
-    return df.drop(columns =["swing_high","swing_low"],inplace=True)
+    return df.drop(columns =["swing_high","swing_low"])
 
 # --- Strategy Class ---
 class RsiLevelsShift(Strategy):
@@ -145,8 +145,8 @@ class RsiLevelsShift(Strategy):
     options_side_config = {
                 "CALL_SUPPORT":"BUY",
                 "CALL_RESISTANCE":"SELL",
-                "PUT_SUPPORT:"SELL",
-                "PUT_RESISTANCE:"BUY",
+                "PUT_SUPPORT":"SELL",
+                "PUT_RESISTANCE":"BUY",
                 },
 
     def init(self):
@@ -327,10 +327,10 @@ def main(backtest_from_to,symbol,formated_symbols,step_size,timeframe,RSI_lenght
     print("Computing RSI indicators...")
     rsi_series = pdt.rsi(consolidated_df[RSI_Source.lower()], timeperiod=RSI_lenght).rename(f'rsi')
     consolidated_df = pd.concat([consolidated_df, rsi_series], axis=1)
-    levels = identify_rsi_levels(consolidated_df,options_levels)
-    levels.to_csv("levels.csv",index=True)
-    print("levelsssss == ",levels)
-    exit(0)
+    consolidated_df = identify_rsi_levels(consolidated_df,options_levels)
+    # levels.to_csv("levels.csv",index=True)
+    # print("levelsssss == ",levels)
+    # exit(0)
     # Initializing Backtest
     print("Starting Backtest...")
     RsiLevelsShift.strike_config = strike_config
