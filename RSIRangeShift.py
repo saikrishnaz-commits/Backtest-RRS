@@ -39,41 +39,83 @@ def ohlc_consolidate(df: pd.DataFrame, timevalue: str, Isvolume: bool = True) ->
     ohlc_df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
     return ohlc_df
 
-# --- Compute Indicators ---
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    # Supertrend: Length = 20, Factor = 2 (as recommended)
-    supertrend = pdt.supertrend(df['high'], df['low'], df['close'], length=20, multiplier=2.0)
-    df = pd.concat([df, supertrend], axis=1)
+def parse_strike(rule, ltp, step=50):
+    """Parse strike rule like 'ATM', 'ATM+100', 'ATM-100'. Returns strike price (int) or None if premium-based."""
+    if isinstance(rule, str) and rule.upper().startswith("P"):
+        # Premium-based selection — handled separately in enter_option_trade
+        return None
+    if isinstance(rule, str) and "ATM" in rule:
+        atm = get_strike(ltp, step)
+        expression = rule.replace("ATM", str(atm))
+        try:
+            return int(eval(expression))
+        except Exception as e:
+            print(f"Error parsing strike rule '{rule}': {e}")
+            return atm
+    return rule
 
-    # MACD: Default (12, 26, 9)
-    macd = pdt.macd(df['close'], fast=12, slow=26, signal=9)
-    df = pd.concat([df, macd], axis=1)
 
-    # Daily Intraday VWAP
-    df['date'] = df.index.date
-    df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
-    df['tp_vol'] = df['typical_price'] * df['volume']
+def get_strike(ltp, step_size):
+    """Round LTP to nearest strike price"""
+    remainder = ltp % step_size
+    if remainder >= step_size / 2:
+        return int(ltp + (step_size - remainder))
+    else:
+        return int(ltp - remainder)
+
+# --- Positions records ---
+def default_records():
+    return {
+            "criteria_timestamp":None,
+            "criteria_type":None,
+            "criteria_breakout_price":None, #high/low
+            "symbol":None,
+            "expiry_date":None,
+            "strike_price":None,
+            "option_type":None,
+            "entry_signal": None,
+            "entry_time": None,
+            "entry_price": None,
+            "profit_points" : None,
+            "stoploss":None,
+            "exit_timestamp":None,
+            "exit_price":None,
+            "reason_for_exit":None,
+            }
+
+def merge_expires(data,symbol):
+    exp_collection = {"NIFTY_EXPIRES":["2020-01-02","2020-01-09","2020-01-16","2020-01-23","2020-01-30","2020-02-06","2020-02-13","2020-02-20","2020-02-27","2020-03-05","2020-03-12","2020-03-19","2020-03-26","2020-04-01","2020-04-09","2020-04-16","2020-04-23","2020-04-30","2020-05-07","2020-05-14","2020-05-21","2020-05-28","2020-06-04","2020-06-11","2020-06-18","2020-06-25","2020-07-02","2020-07-09","2020-07-16","2020-07-23","2020-07-30","2020-08-06","2020-08-13","2020-08-20","2020-08-27","2020-09-03","2020-09-10","2020-09-17","2020-09-24","2020-10-01","2020-10-08","2020-10-15","2020-10-22","2020-10-29","2020-11-05","2020-11-12","2020-11-19","2020-11-26","2020-12-03","2020-12-10","2020-12-17","2020-12-24","2020-12-31","2021-01-07","2021-01-14","2021-01-21","2021-01-28","2021-02-04","2021-02-11","2021-02-18","2021-02-25","2021-03-04","2021-03-10","2021-03-18","2021-03-25","2021-04-01","2021-04-08","2021-04-15","2021-04-22","2021-04-29","2021-05-06","2021-05-12","2021-05-20","2021-05-27","2021-06-03","2021-06-10","2021-06-17","2021-06-24","2021-07-01","2021-07-08","2021-07-15","2021-07-22","2021-07-29","2021-08-05","2021-08-12","2021-08-18","2021-08-26","2021-09-02","2021-09-09","2021-09-16","2021-09-23","2021-09-30","2021-10-07","2021-10-14","2021-10-21","2021-10-28","2021-11-03","2021-11-11","2021-11-18","2021-11-25","2021-12-02","2021-12-09","2021-12-16","2021-12-23","2021-12-30","2022-01-06","2022-01-13","2022-01-20","2022-01-27","2022-02-03","2022-02-10","2022-02-17","2022-02-24","2022-03-03","2022-03-10","2022-03-17","2022-03-24","2022-03-31","2022-04-07","2022-04-13","2022-04-21","2022-04-28","2022-05-05","2022-05-12","2022-05-19","2022-05-26","2022-06-02","2022-06-09","2022-06-16","2022-06-23","2022-06-30","2022-07-07","2022-07-14","2022-07-21","2022-07-28","2022-08-04","2022-08-11","2022-08-18","2022-08-25","2022-09-01","2022-09-08","2022-09-15","2022-09-22","2022-09-29","2022-10-06","2022-10-13","2022-10-20","2022-10-27","2022-11-03","2022-11-10","2022-11-17","2022-11-24","2022-12-01","2022-12-08","2022-12-15","2022-12-22","2022-12-29","2023-01-05","2023-01-12","2023-01-19","2023-01-25","2023-02-02","2023-02-09","2023-02-16","2023-02-23","2023-03-02","2023-03-09","2023-03-16","2023-03-23","2023-03-29","2023-03-30","2023-04-06","2023-04-13","2023-04-20","2023-04-27","2023-05-04","2023-05-11","2023-05-18","2023-05-25","2023-06-01","2023-06-08","2023-06-15","2023-06-22","2023-06-28","2023-06-29","2023-07-06","2023-07-13","2023-07-20","2023-07-27","2023-08-03","2023-08-10","2023-08-17","2023-08-24","2023-08-31","2023-09-07","2023-09-14","2023-09-21","2023-09-28","2023-10-05","2023-10-12","2023-10-19","2023-10-26","2023-11-02","2023-11-09","2023-11-16","2023-11-23","2023-11-30","2023-12-07","2023-12-14","2023-12-21","2023-12-28","2024-01-04","2024-01-11","2024-01-18","2024-01-25","2024-02-01","2024-02-08","2024-02-15","2024-02-22","2024-02-29","2024-03-07","2024-03-14","2024-03-21","2024-03-28","2024-04-04","2024-04-10","2024-04-18","2024-04-25","2024-05-02","2024-05-09","2024-05-16","2024-05-23","2024-05-30","2024-06-06","2024-06-13","2024-06-20","2024-06-27","2024-07-04","2024-07-11","2024-07-18","2024-07-25","2024-08-01","2024-08-08","2024-08-14","2024-08-22","2024-08-29","2024-09-05","2024-09-12","2024-09-19","2024-09-26","2024-10-03","2024-10-10","2024-10-17","2024-10-24","2024-10-31","2024-11-07","2024-11-14","2024-11-21","2024-11-28","2024-12-05","2024-12-12","2024-12-19","2024-12-26","2025-01-02","2025-01-09","2025-01-16","2025-01-23","2025-01-30","2025-02-06","2025-02-13","2025-02-20","2025-02-27","2025-03-06","2025-03-13","2025-03-20","2025-03-27","2025-04-03","2025-04-09","2025-04-17","2025-04-24","2025-04-30","2025-05-08","2025-05-15","2025-05-22","2025-05-29","2025-06-05","2025-06-12","2025-06-19","2025-06-26","2025-07-03","2025-07-10","2025-07-17","2025-07-24","2025-07-31","2025-08-07","2025-08-14","2025-08-21","2025-08-28","2025-09-02","2025-09-09","2025-09-16","2025-09-23","2025-09-25","2025-09-30","2025-10-07","2025-10-14","2025-10-20","2025-10-28","2025-11-04","2025-11-11","2026-01-06","2026-01-13","2026-01-20","2026-01-27","2026-02-03","2026-02-10","2026-02-17","2026-02-24","2026-03-02","2026-03-10","2026-03-17","2026-03-24","2026-03-26","2026-03-30","2026-03-31","2026-04-07","2026-04-13","2026-04-21","2026-04-28","2026-05-05","2026-05-12","2026-05-19","2026-05-26","2026-06-02","2026-06-09","2026-06-16","2026-06-23","2026-06-25","2026-06-30","2026-07-07","2026-07-28","2026-08-25","2026-09-29","2026-12-29","2026-12-31"]}
+
+    data = data.copy()
+    data.index = pd.to_datetime(data.index)
+    data['datetime'] = pd.to_datetime(data.index)
+
+    # 1) Add a pure date column to data
+    data["trade_date"] = data.index.normalize()  # strips time -> 2024-01-04 00:00:00
+    # 2) Prepare expiry df with a date column
+    exp_df = pd.DataFrame({
+        "expiry": pd.to_datetime(exp_collection[f"{symbol}_EXPIRES"])
+    }).sort_values("expiry")
+
+    exp_df["expiry_date"] = exp_df["expiry"].dt.normalize()
+
+    # 3) merge_asof on date, not full timestamp
+    final_df = pd.merge_asof(
+        data.sort_values("trade_date"),
+        exp_df[["expiry_date", "expiry"]].sort_values("expiry_date"),
+        left_on="trade_date",
+        right_on="expiry_date",
+        direction="forward"
+    )
+
+    # 4) Clean up
+    final_df = final_df.drop(columns=["trade_date", "expiry_date"])
+    final_df.set_index(keys="datetime",inplace=True)
+    final_df["expiry"] = pd.to_datetime(final_df["expiry"]).dt.date
+    final_df.dropna(subset=["expiry"],inplace=True)
+    final_df.sort_values(by="datetime",inplace=True)
+    return final_df
     
-    # Calculate VWAP
-    vwap = df.groupby('date').apply(lambda x: x['tp_vol'].cumsum() / x['volume'].cumsum())
-    # Resetting the index from the groupby operation so it maps correctly back
-    df['vwap'] = vwap.reset_index(level=0, drop=True)
-
-    df.drop(columns=['date', 'typical_price', 'tp_vol'], inplace=True)
-    
-    # Rename columns to standardized names for strategy
-    rename_map = {
-        'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume',
-        'SUPERT_20_2.0': 'SUPERT',
-        'SUPERTd_20_2.0': 'SUPERTd', # 1 for Bullish, -1 for Bearish
-        'MACD_12_26_9': 'MACD',
-        'MACDs_12_26_9': 'MACD_Signal',
-        'MACDh_12_26_9': 'MACD_Hist',
-        'vwap': 'VWAP'
-    }
-    df.rename(columns=rename_map, inplace=True)
-    return df
-
 
 def identify_rsi_levels(df,options_levels, prominence=10, distance=5, tolerance=1.5):
     df = df.copy()
@@ -138,176 +180,59 @@ def identify_rsi_levels(df,options_levels, prominence=10, distance=5, tolerance=
 # --- Strategy Class ---
 class RsiLevelsShift(Strategy):
     strike_config = "ATM"
+    step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
+    OPTIONS_PATH = "options_dir"
     options_levels = {
-            "CALL":{"support":60,"resistance":40},
-            "PUT":{"support":40,"resistance":60}
-            }
+                "CALL_level":60,
+                "PUT_level":40
+                }
     options_side_config = {
                 "CALL_SUPPORT":"BUY",
                 "CALL_RESISTANCE":"SELL",
                 "PUT_SUPPORT":"SELL",
                 "PUT_RESISTANCE":"BUY",
                 },
+    RSI_lenght = 14
+    symbol = "NIFTY"
 
     def init(self):
         # State tracking
-       self.data
+       self.current_trade = default_records()
         
     def next(self):
-        if len(self.data) < 5:
+        if len(self.data) < self.RSI_lenght:
             return
 
         current_time = self.data.index[-1].time()
-        
         # 1. Intraday Exit (Square off before market close)
-        if current_time >= time(15, 15):
-            if self.position.size != 0:
-                self.position.close()
-            self.trade_active = False
-            self.trade_dir = 0
-            return
+        trade_fill_type = (self.data.signal[-2])
+        if  trade_fill_type and (not self.current_trade["entry_price"]):
+            print("current_time == ",current_time)
+            print(trade_fill_type)
+            opttype,criteriatype = trade_fill_type.split("_")
+            # print(opttype)
+            if (trade_fill_type in self.options_side_config):
+                transtype = self.options_side_config[trade_fill_type].upper()
+                if (transtype == "BUY") and (self.data.High[-2] > self.data.Close[-1]):
+                    self.current_trade["criteria_timestamp"] = self.data.index[-2]
+                    self.current_trade["criteria_type"] = criteriatype
+                    self.current_trade["criteria_breakout_price"] = self.data.High[-2]
+                    self.current_trade["option_type"] = opttype
+                    self.current_trade["entry_signal"] = transtype
+                    self.current_trade["symbol"] = self.symbol
+                    self.current_trade["entry_time"] = self.data.index[-1]
+                    self.current_trade["expiry_date"] = self.data.expiry[-1]
+                    self.current_trade["strike_price"] = parse_strike(self.strike_config, self.data.Close[-1], self.step_size.get(self.symbol, 50))
+                    ATM_KEY = f"pe_{self.symbol.lower()}_{self.data.expiry[-1]}_strike_{float(self.current_trade["strike_price"])}"
 
-        # Current values
-        st_dir = self.data.SUPERTd[-1]
-        st_val = self.data.SUPERT[-1]
-        
-        mac_line = self.data.MACD[-1]
-        mac_sig = self.data.MACD_Signal[-1]
-        
-        c = self.data.Close[-1]
-        o = self.data.Open[-1]
-        h = self.data.High[-1]
-        l = self.data.Low[-1]
-        v = self.data.VWAP[-1]
-
-        # Check conditions
-        macd_bullish = mac_line > mac_sig
-        macd_bearish = mac_line < mac_sig
-        
-        # VWAP condition (Near or above/below)
-        # Using 0.2% tolerance for "near" VWAP
-        price_near_above_vwap = c >= (v * 0.998)
-        price_near_below_vwap = c <= (v * 1.002)
-
-        # Reversal signals
-        st_bullish_flip = (self.data.SUPERTd[-2] == -1) and (self.data.SUPERTd[-1] == 1)
-        st_bearish_flip = (self.data.SUPERTd[-2] == 1) and (self.data.SUPERTd[-1] == -1)
-
-        macd_bullish_cross = (self.data.MACD[-2] <= self.data.MACD_Signal[-2]) and macd_bullish
-        macd_bearish_cross = (self.data.MACD[-2] >= self.data.MACD_Signal[-2]) and macd_bearish
-
-        # Lookback for MACD cross (last 4 candles)
-        recent_macd_bull_cross = any(
-            (self.data.MACD[-i] > self.data.MACD_Signal[-i]) and (self.data.MACD[-i-1] <= self.data.MACD_Signal[-i-1])
-            for i in range(1, 5) if len(self.data.MACD) > i+1
-        ) or macd_bullish_cross
-        
-        recent_macd_bear_cross = any(
-            (self.data.MACD[-i] < self.data.MACD_Signal[-i]) and (self.data.MACD[-i-1] >= self.data.MACD_Signal[-i-1])
-            for i in range(1, 5) if len(self.data.MACD) > i+1
-        ) or macd_bearish_cross
-
-        # --- Active Trade Management (Exits & Stop Loss) ---
-        if self.position.size != 0:
-            # Trailing Stop Loss
-            if self.position.is_long:
-                # Stop loss at Supertrend line
-                if c < st_val:
-                    self.position.close()
-                    self.trade_active = False
-                    self.trade_dir = 0
-            elif self.position.is_short:
-                if c > st_val:
-                    self.position.close()
-                    self.trade_active = False
-                    self.trade_dir = 0
-
-            # Profit Booking Rule 1: Opposite MACD Crossover -> Book 50%
-            if not self.partial_exit_done:
-                if self.position.is_long and macd_bearish_cross:
-                    self.sell(size=abs(self.position.size) // 2)
-                    self.partial_exit_done = True
-                elif self.position.is_short and macd_bullish_cross:
-                    self.buy(size=abs(self.position.size) // 2)
-                    self.partial_exit_done = True
-
-            # Rule 2: Supertrend Reverses -> Exit 100%
-            if self.position.is_long and st_bearish_flip:
-                self.position.close()
-                self.trade_active = False
-                self.trade_dir = 0
-            elif self.position.is_short and st_bullish_flip:
-                self.position.close()
-                self.trade_active = False
-                self.trade_dir = 0
-
-            # --- Pyramiding / Re-entry Logic ---
-            # Wait at least a few candles between re-entries to avoid spam
-            if len(self.data) > self.last_reentry_index + 1:
-                body = abs(c - o)
-                tot = h - l
-                # Avoid div by zero
-                if tot == 0: tot = 0.01
-
-                # Re-entry Long
-                if self.position.is_long and abs(self.position.size) < self.max_qty:
-                    if st_dir == 1 and macd_bullish:
-                        # Check candlestick pattern
-                        is_doji = body <= (tot * 0.1)
-                        lower_wick = min(o, c) - l
-                        upper_wick = h - max(o, c)
-                        is_hammer = (lower_wick >= 2 * body) and (upper_wick <= body)
-
-                        if is_doji or is_hammer:
-                            self.buy(size=self.qty_per_entry)
-                            self.last_reentry_index = len(self.data)
-
-                # Re-entry Short
-                elif self.position.is_short and abs(self.position.size) < self.max_qty:
-                    if st_dir == -1 and macd_bearish:
-                        # Check candlestick pattern
-                        is_doji = body <= (tot * 0.1)
-                        lower_wick = min(o, c) - l
-                        upper_wick = h - max(o, c)
-                        is_shooting_star = (upper_wick >= 2 * body) and (lower_wick <= body)
-
-                        if is_doji or is_shooting_star:
-                            self.sell(size=self.qty_per_entry)
-                            self.last_reentry_index = len(self.data)
-
-        # --- Entry Logic ---
-        if self.position.size == 0:
-            st_recent_flip = any(
-                (self.data.SUPERTd[-i-1] == -1) and (self.data.SUPERTd[-i] == 1)
-                for i in range(1, 5) if len(self.data.SUPERTd) > i
-            ) or st_bullish_flip
+                    
+                        
             
-            st_recent_bear_flip = any(
-                (self.data.SUPERTd[-i-1] == 1) and (self.data.SUPERTd[-i] == -1)
-                for i in range(1, 5) if len(self.data.SUPERTd) > i
-            ) or st_bearish_flip
-
-            cond_buy = st_dir == 1 and macd_bullish and price_near_above_vwap and ((st_bullish_flip and recent_macd_bull_cross) or (macd_bullish_cross and st_recent_flip))
-            if cond_buy:
-                self.buy(size=self.qty_per_entry)
-                self.trade_active = True
-                self.trade_dir = 1
-                self.partial_exit_done = False
-                self.last_reentry_index = len(self.data)
-
-            # Sell Entry
-            cond_sell = st_dir == -1 and macd_bearish and price_near_below_vwap and ((st_bearish_flip and recent_macd_bear_cross) or (macd_bearish_cross and st_recent_bear_flip))
-            if cond_sell:
-                self.sell(size=self.qty_per_entry)
-                self.trade_active = True
-                self.trade_dir = -1
-                self.partial_exit_done = False
-                self.last_reentry_index = len(self.data)
+            # exit(0)
 
 
 
-
-def main(backtest_from_to,symbol,formated_symbols,step_size,timeframe,RSI_lenght,RSI_Source,strike_config,options_levels,options_side_config):
+def main(backtest_from_to,symbol,OPTIONS_PATH,formated_symbols,step_size,timeframe,RSI_lenght,RSI_Source,strike_config,options_levels,options_side_config):
     
     
     csv_file = "trading_data_nifty.csv"
@@ -325,17 +250,23 @@ def main(backtest_from_to,symbol,formated_symbols,step_size,timeframe,RSI_lenght
     
     # Compute indicators
     print("Computing RSI indicators...")
-    rsi_series = pdt.rsi(consolidated_df[RSI_Source.lower()], timeperiod=RSI_lenght).rename(f'rsi')
+    rsi_series = pdt.rsi(consolidated_df[RSI_Source.lower()],length = RSI_lenght).rename(f'rsi')
     consolidated_df = pd.concat([consolidated_df, rsi_series], axis=1)
     consolidated_df = identify_rsi_levels(consolidated_df,options_levels)
-    # levels.to_csv("levels.csv",index=True)
-    # print("levelsssss == ",levels)
+    consolidated_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"},inplace=True)
+    # print("levelsssss == ",consolidated_df)
     # exit(0)
+    consolidated_df = merge_expires(consolidated_df,symbol)
+    consolidated_df.to_csv("levels.csv",index=True)
     # Initializing Backtest
     print("Starting Backtest...")
     RsiLevelsShift.strike_config = strike_config
     RsiLevelsShift.options_levels = options_levels
     RsiLevelsShift.options_side_config = options_side_config
+    RsiLevelsShift.RSI_lenght = RSI_lenght
+    RsiLevelsShift.symbol = symbol
+    RsiLevelsShift.OPTIONS_PATH = OPTIONS_PATH
+    RsiLevelsShift.step_size = step_size
     
     
     bt = Backtest(
@@ -364,11 +295,12 @@ if __name__ == "__main__":
     backtest_from_to = {"start_date":datetime(2025,1,1),"end_date":datetime(2025,9,30)},
     symbol = "NIFTY",
     formated_symbols={"NIFTY":"NIFTY 50","SENSEX":"SENSEX","BANKNIFTY":"NIFTY BANK"},
-    step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
-    timeframe = "15min", 
-    RSI_lenght = 3,
+    timeframe = "5min", 
+    RSI_lenght = 14,
     RSI_Source = "Close",
-    strike_config = "ATM",
+    strike_config = "ATM",  # "ATM", "ATM+100", "ATM-100" or "P30", "P200" (premium-based)
+    step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
+    OPTIONS_PATH = "",
     options_levels = {
                 "CALL_level":60,
                 "PUT_level":40
