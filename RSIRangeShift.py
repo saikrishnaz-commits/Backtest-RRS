@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import pandas_ta as pdt
 from backtesting import Backtest, Strategy
-from datetime import datetime, time
+from datetime import datetime, time as dtime
 import os
 from scipy.signal import find_peaks
 
@@ -16,7 +16,7 @@ def ohlc_consolidate(df: pd.DataFrame, timevalue: str, Isvolume: bool = True) ->
     df.index = pd.to_datetime(df.index)
 
     # Filter time range
-    df = df[(df.index.time >= time(9, 15)) & (df.index.time < time(15, 30))]
+    df = df[(df.index.time >= dtime(9, 15)) & (df.index.time < dtime(15, 30))]
 
     # Resample
     ohlc_df = df.resample(
@@ -81,6 +81,7 @@ def default_records():
             "exit_timestamp":None,
             "exit_price":None,
             "reason_for_exit":None,
+            "options_data":None,
             }
 
 def merge_expires(data,symbol):
@@ -116,6 +117,7 @@ def merge_expires(data,symbol):
     final_df.sort_values(by="datetime",inplace=True)
     return final_df
     
+                    
 
 def identify_rsi_levels(df,options_levels, prominence=10, distance=5, tolerance=1.5):
     df = df.copy()
@@ -180,6 +182,7 @@ def identify_rsi_levels(df,options_levels, prominence=10, distance=5, tolerance=
 # --- Strategy Class ---
 class RsiLevelsShift(Strategy):
     strike_config = "ATM"
+    signals = []
     step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
     OPTIONS_PATH = "options_dir"
     options_levels = {
@@ -194,11 +197,52 @@ class RsiLevelsShift(Strategy):
                 },
     RSI_lenght = 14
     symbol = "NIFTY"
+    def generate_symbol(self,option_type):
+        expiry = self.data.expiry[-1].strftime("%y%m%d")
+
+        ATM_KEY = (
+            f"{self.symbol.upper()}"
+            f"{expiry}"
+            f"{int(float(self.current_trade['strike_price']))}"
+            f"{option_type.upper()}"
+        )
+        return ATM_KEY
+    
+    def trade_finished(self):
+        if self.current_trade["entry_signal"] == "BUY":
+            self.current_trade["profit_points"] = (
+                self.current_trade["exit_price"] -
+                self.current_trade["entry_price"]
+            )
+        elif self.current_trade["entry_signal"] == "SELL":
+            self.current_trade["profit_points"] = (
+                self.current_trade["entry_price"] -
+                self.current_trade["exit_price"]
+            )
+
+        RsiLevelsShift.signals.append([
+            self.current_trade["criteria_timestamp"],
+            self.current_trade["criteria_type"],
+            self.current_trade["criteria_breakout_price"],
+            self.current_trade["symbol"],
+            self.current_trade["expiry_date"],
+            self.current_trade["strike_price"],
+            self.current_trade["option_type"],
+            self.current_trade["entry_signal"],
+            self.current_trade["entry_time"],
+            self.current_trade["entry_price"],
+            self.current_trade["profit_points"],
+            self.current_trade["stoploss"],
+            self.current_trade["exit_timestamp"],
+            self.current_trade["exit_price"],
+            self.current_trade["reason_for_exit"],
+        ])
+        self.current_trade = default_records()
 
     def init(self):
         # State tracking
        self.current_trade = default_records()
-        
+    
     def next(self):
         if len(self.data) < self.RSI_lenght:
             return
@@ -213,37 +257,165 @@ class RsiLevelsShift(Strategy):
             # print(opttype)
             if (trade_fill_type in self.options_side_config):
                 transtype = self.options_side_config[trade_fill_type].upper()
-                if (transtype == "BUY") and (self.data.High[-2] > self.data.Close[-1]):
+                is_call = (opttype == "CALL")
+                is_put = (opttype == "PUT")
+                high_breakout = (self.data.Close[-1] > self.data.High[-2])
+                low_breakdown = (self.data.Close[-1] < self.data.Low[-2])
+                # ---------- call-sell,put-buy ----------------
+                if (criteriatype.upper() == "RESISTANCE") and ((is_call and low_breakdown) or (is_put and high_breakout)) :
                     self.current_trade["criteria_timestamp"] = self.data.index[-2]
                     self.current_trade["criteria_type"] = criteriatype
-                    self.current_trade["criteria_breakout_price"] = self.data.High[-2]
                     self.current_trade["option_type"] = opttype
+                    
                     self.current_trade["entry_signal"] = transtype
                     self.current_trade["symbol"] = self.symbol
                     self.current_trade["entry_time"] = self.data.index[-1]
                     self.current_trade["expiry_date"] = self.data.expiry[-1]
                     self.current_trade["strike_price"] = parse_strike(self.strike_config, self.data.Close[-1], self.step_size.get(self.symbol, 50))
-                    ATM_KEY = f"pe_{self.symbol.lower()}_{self.data.expiry[-1]}_strike_{float(self.current_trade["strike_price"])}"
+                    if is_call:
+                        self.current_trade["stoploss"] = self.data.High[-2]
+                        self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
+                        ATM_KEY = self.generate_symbol("CE")
+                    else:
+                        self.current_trade["stoploss"] = self.data.Low[-2]
+                        self.current_trade["criteria_breakout_price"] = self.data.High[-2]
+                        ATM_KEY = self.generate_symbol("PE")
 
+                    ATM_DF =  pd.read_csv(os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv",),names=["Date","Time","Open","High","Low","Close","Volume","IO"],index_col=False,parse_dates=[["Date","Time"]])
+                    ATM_DF.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+                    ATM_DF = ATM_DF[ATM_DF["timestamp"].dt.date == self.data.index[-1].date()].sort_values(by="timestamp")
+                    self.current_trade["entry_price"] = ATM_DF[ATM_DF["timestamp"] <= self.data.index[-1]].iloc[-1]["Close"]    
+                    self.current_trade["options_data"] = ATM_DF
+                    return
+                # ---------- call-buy,put-sell ----------------
+                if (criteriatype.upper() == "SUPPORT") and ((is_call and high_breakout) or (is_put and low_breakdown)) :
+                    self.current_trade["criteria_timestamp"] = self.data.index[-2]
+                    self.current_trade["criteria_type"] = criteriatype
+                    self.current_trade["option_type"] = opttype
                     
-                        
-            
-            # exit(0)
+                    self.current_trade["entry_signal"] = transtype
+                    self.current_trade["symbol"] = self.symbol
+                    self.current_trade["entry_time"] = self.data.index[-1]
+                    self.current_trade["expiry_date"] = self.data.expiry[-1]
+                    self.current_trade["strike_price"] = parse_strike(self.strike_config, self.data.Close[-1], self.step_size.get(self.symbol, 50))
+                    if is_call:
+                        self.current_trade["stoploss"] = self.data.Low[-2]
+                        self.current_trade["criteria_breakout_price"] = self.data.High[-2]
+                        ATM_KEY = self.generate_symbol("CE")
+
+                    else:
+                        self.current_trade["stoploss"] = self.data.High[-2]
+                        self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
+                        ATM_KEY = self.generate_symbol("PE")
+
+                    ATM_DF =  pd.read_csv(os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv",),names=["Date","Time","Open","High","Low","Close","Volume","IO"],index_col=False,parse_dates=[["Date","Time"]])
+                    ATM_DF.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+                    ATM_DF = ATM_DF[ATM_DF["timestamp"].dt.date == self.data.index[-1].date()].sort_values(by="timestamp")
+                    self.current_trade["entry_price"] = ATM_DF[ATM_DF["timestamp"] <= self.data.index[-1]].iloc[-1]["Close"]    
+                    self.current_trade["options_data"] = ATM_DF
+                    return
+                    
+        elif self.current_trade["entry_price"] :
+            if (self.current_trade["entry_signal"] == "BUY"):
+                if self.data.Low[-1] < self.current_trade["stoploss"]:
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Stoploss"
+                    self.trade_finished()
+
+                elif self.data.Close[-1] < self.data.Low[-2]:
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Closed Below Prevous Low"
+                    self.trade_finished()
+                
+                elif self.data.index[-1].time() >= dtime(15,15):
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Exittime"
+                    self.trade_finished()
+
+                
+            elif (self.current_trade["entry_signal"] == "SELL"):
+                if self.data.High[-1] > self.current_trade["stoploss"]:
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Stoploss"
+                    self.trade_finished()
+
+                elif self.data.Close[-1] > self.data.High[-2]:
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Closed Above Prevous High"
+                    self.trade_finished()
+                
+                elif self.data.index[-1].time() >= dtime(15,15):
+                    ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
+                    EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
+
+                    self.current_trade["exit_timestamp"] = self.data.index[-1] 
+                    self.current_trade["exit_price"] = EXIT_ATM_df
+                    self.current_trade["reason_for_exit"] = "Exittime"
+                    self.trade_finished()
+                    
+
+# ------------------------------------------------------------------------------------------------
+def recovery_days(cum_pnl):
+    peak = cum_pnl.cummax()
+    drawdown = cum_pnl - peak
+
+    print("drawdown == ",drawdown)
+    print("cum_pnl == ",cum_pnl)
+    max_dd_idx = drawdown.idxmin()
+    print("max_dd_idx === ",max_dd_idx)
+    peak_before_dd = peak[:max_dd_idx].iloc[-1]
+
+  
+    dd_start_idx = peak[:max_dd_idx][peak[:max_dd_idx] == peak_before_dd].index[-1]
+
+ 
+    recovery_point = cum_pnl[max_dd_idx:]
+    recovered = recovery_point[recovery_point >= peak_before_dd]
+
+    if recovered.empty:
+        return None  
+
+    recovery_idx = recovered.index[0]
+    recovery_duration = (recovery_idx - dd_start_idx).days
+
+    return recovery_duration
 
 
 
-def main(backtest_from_to,symbol,OPTIONS_PATH,formated_symbols,step_size,timeframe,RSI_lenght,RSI_Source,strike_config,options_levels,options_side_config):
+
+def main(backtest_from_to,csv_file,only_expiry,symbol,OPTIONS_PATH,formated_symbols,step_size,timeframe,RSI_lenght,RSI_Source,strike_config,options_levels,options_side_config):
+    cash_rs = 25000
     
-    
-    csv_file = "trading_data_nifty.csv"
     if not os.path.exists(csv_file):
         print(f"Data file not found: {csv_file}")
         return
 
     # Load 1-min data
     print("Loading data...")
-    df = pd.read_csv(csv_file)
-    
+    # df = pd.read_csv(csv_file)
+    df =  pd.read_csv(csv_file,names=["Date","Time","open","high","low","close","volume","io"],index_col=False,parse_dates=[["Date","Time"]])
+    df.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+    df = df[(df["timestamp"] >= backtest_from_to["start_date"]) & (df["timestamp"] <= backtest_from_to["end_date"])]
     # Consolidate to 5-min
     print("Consolidating to 5-min timeframe...")
     consolidated_df = ohlc_consolidate(df, timeframe, Isvolume=True)
@@ -255,9 +427,13 @@ def main(backtest_from_to,symbol,OPTIONS_PATH,formated_symbols,step_size,timefra
     consolidated_df = identify_rsi_levels(consolidated_df,options_levels)
     consolidated_df.rename(columns={"open":"Open","high":"High","low":"Low","close":"Close"},inplace=True)
     # print("levelsssss == ",consolidated_df)
-    # exit(0)
     consolidated_df = merge_expires(consolidated_df,symbol)
+    if only_expiry:
+        consolidated_df = consolidated_df[
+            consolidated_df.index.date == pd.to_datetime(consolidated_df["expiry"]).dt.date
+        ]
     consolidated_df.to_csv("levels.csv",index=True)
+    # exit(0)
     # Initializing Backtest
     print("Starting Backtest...")
     RsiLevelsShift.strike_config = strike_config
@@ -280,14 +456,90 @@ def main(backtest_from_to,symbol,OPTIONS_PATH,formated_symbols,step_size,timefra
     
     # Print basic stats
     print("\n--- Backtest Statistics ---")
-    print(stats)
+    # print(stats)
+    trades_df= pd.DataFrame(RsiLevelsShift.signals, columns=[
+        [
+            "criteria_timestamp",
+            "criteria_type",
+            "criteria_breakout_price",
+            "symbol",
+            "expiry_date",
+            "strike_price",
+            "option_type",
+            "entry_signal",
+            "ENTRY_TIME",
+            "entry_price",
+            "PNL",
+            "stoploss",
+            "EXIT_TIME",
+            "exit_price",
+            "reason_for_exit",
+            ]
+        ]) 
+
+    trades_df['ENTRY_TIME'] = pd.to_datetime(trades_df['ENTRY_TIME'])
+    trades_df['EXIT_TIME'] = pd.to_datetime(trades_df['EXIT_TIME'])
+    trades_df['month'] = trades_df['EXIT_TIME'].dt.to_period('M')
+    trades_df['year'] = trades_df['EXIT_TIME'].dt.year
     
-    # Save trades to CSV
-    if hasattr(stats, '_trades') and not stats._trades.empty:
-        stats._trades.to_csv("triple_conf_trades.csv", index=False)
-        print("\nTrades saved to triple_conf_trades.csv")
-    else:
-        print("\nNo trades executed.")
+    monthly_pnl = trades_df.groupby('month')['PNL'].sum()
+
+    yearly_pnl = trades_df.groupby('year')['PNL'].sum()
+    
+    drawdown_data = []
+    for year, group in trades_df.groupby('year'):
+        cum_pnl = group['PNL'].cumsum()
+        peak = cum_pnl.cummax()
+        drawdown = (cum_pnl - peak)
+        max_dd = drawdown.min()
+        drawdown_data.append((year, max_dd))
+    
+    monthly_trades = trades_df.groupby('month').size()
+    cum_pnl = trades_df['PNL'].cumsum()
+    cum_pnl.index = trades_df['EXIT_TIME']
+
+    recovery_days_from_dd = recovery_days(cum_pnl)
+
+    # trades_df.to_csv("trades.csv", index=False)
+    highest_profit = trades_df['PNL'].max()
+    highest_loss = trades_df['PNL'].min()
+    
+    
+    roi_data = (yearly_pnl / cash_rs) * 100
+    summary_rows = []
+    
+    for period, pnl in monthly_pnl.items():
+        summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': pnl, 'option_type': f'Monthly PnL ({period})'})
+
+    for year, pnl in yearly_pnl.items():
+        summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME':None, 'PNL': pnl, 'option_type': f'Total Year PnL ({year})'})
+
+    for year, dd in drawdown_data:
+        summary_rows.append({'ENTRY_TIME':None, 'EXIT_TIME': None, 'PNL': dd, 'option_type': f'Max Drawdown ({year})'})
+
+
+    for year, roi in roi_data.items():
+        summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': roi, 'option_type': f'ROI % ({year})'})
+
+
+    for period, count in monthly_trades.items():
+        summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': count, 'option_type': f'Trades in ({period})'})
+    
+    summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': recovery_days_from_dd, 'option_type': 'Recovery Days from MaxDD'})
+    summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': highest_profit, 'option_type': 'Highest Single Trade Profit'})
+    summary_rows.append({'ENTRY_TIME': None, 'EXIT_TIME': None, 'PNL': highest_loss, 'option_type': 'Highest Single Trade Loss'})
+
+    summary_df = pd.DataFrame(summary_rows)
+    final_df = pd.concat([trades_df, summary_df], ignore_index=True)
+    final_df.drop(columns=["year","month"],inplace=True)
+    final_df.to_csv("Backtest_df.csv",index=False)
+
+    # # Save trades to CSV
+    # if hasattr(stats, '_trades') and not stats._trades.empty:
+    #     stats._trades.to_csv("triple_conf_trades.csv", index=False)
+    #     print("\nTrades saved to triple_conf_trades.csv")
+    # else:
+    #     print("\nNo trades executed.")
 
 if __name__ == "__main__":
     
@@ -298,9 +550,11 @@ if __name__ == "__main__":
     timeframe = "5min", 
     RSI_lenght = 14,
     RSI_Source = "Close",
-    strike_config = "ATM",  # "ATM", "ATM+100", "ATM-100" or "P30", "P200" (premium-based)
+    strike_config = "ATM",  # "ATM", "ATM+100", "ATM-100" 
     step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
+    only_expiry = False,
     OPTIONS_PATH = "",
+    csv_file = "",
     options_levels = {
                 "CALL_level":60,
                 "PUT_level":40
