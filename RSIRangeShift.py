@@ -1,3 +1,62 @@
+"""
+RSI Range Shift Backtest Strategy
+=================================
+Youtube URL : https://youtu.be/v5hoPMN2RP0?si=txQh-GyB_bMNMUou
+This backtest program implements an intraday options trading strategy based on RSI range shifts and candlestick breakouts/breakdowns on spot index data (e.g., NIFTY).
+
+1. Core Concept
+---------------
+- The strategy identifies support and resistance levels on the RSI (Relative Strength Index, default length 14) of the consolidated spot price (5-minute interval).
+- It checks for swing highs and swing lows on the RSI line using scipy's peak finding.
+- A swing low near the Call Level (default 60 +/- 1.5 tolerance) indicates "CALL_SUPPORT".
+- A swing high near the Call Level (60 +/- 1.5) indicates "CALL_RESISTANCE".
+- A swing low near the Put Level (default 40 +/- 1.5) indicates "PUT_SUPPORT".
+- A swing high near the Put Level (40 +/- 1.5) indicates "PUT_RESISTANCE".
+
+2. Entry Conditions (Spot-driven Breakout/Breakdown)
+-----------------------------------------------------
+On every candle, the strategy looks at the signal from the previous candle (candle at index [-2]):
+- SUPPORT Signal (CALL_SUPPORT or PUT_SUPPORT) at [-2]:
+  - Enter trade if the current candle Close [-1] breaks out above the High of the support candle [-2] (i.e., Close[-1] > High[-2]).
+  - Direction: BUY Call / SELL Put (determined by options_side_config).
+  - Stoploss: Low of the support candle [-2].
+- RESISTANCE Signal (CALL_RESISTANCE or PUT_RESISTANCE) at [-2]:
+  - Enter trade if the current candle Close [-1] breaks down below the Low of the resistance candle [-2] (i.e., Close[-1] < Low[-2]).
+  - Direction: SELL Call / BUY Put (determined by options_side_config).
+  - Stoploss: High of the resistance candle [-2].
+
+3. Option Selection
+-------------------
+- Once a breakout/breakdown triggers, the strategy selects the ATM (At-The-Money) options strike based on the spot Close price.
+- It loads the corresponding 1-minute options data from the OPTIONS_PATH (e.g., NIFTYyymmdd[Strike][CE/PE].csv) for that day.
+- Entry price in the option contract is recorded as the Close price at the end of the entry bar.
+
+4. Exit Conditions
+------------------
+Positions are exited based on the underlying spot price movement:
+- For Long Call / Short Put positions:
+  - Stoploss: Spot Low[-1] falls below the entry candle's stoploss (Low[-2]).
+  - Technical Exit: Spot Close[-1] closes below the previous candle's low (Low[-2]).
+  - Intraday Exit: Time reaches 15:15 or later.
+- For Short Call / Long Put positions:
+  - Stoploss: Spot High[-1] rises above the entry candle's stoploss (High[-2]).
+  - Technical Exit: Spot Close[-1] closes above the previous candle's high (High[-2]).
+  - Intraday Exit: Time reaches 15:15 or later.
+- The option exit price is filled from the option's 1-minute close price corresponding to the exit timestamp.
+
+5. Performance Reporting & Metrics
+----------------------------------
+After the backtest run completes, it calculates:
+- Monthly & Yearly PNL.
+- Annualized Max Drawdown.
+- ROI % based on an initial capital of 25,000 RS.
+- Recovery Days from Max Drawdown.
+- Highest single-trade profit and loss.
+- Total trade count per month.
+- Saves the trade-by-trade log and summary statistics to BACKTEST_RSI_RANGE_SHIFT.csv.
+"""
+
+
 # from IPython.core import autocall
 import pandas as pd
 import numpy as np
@@ -76,10 +135,10 @@ def default_records():
             "entry_signal": None,
             "entry_time": None,
             "entry_price": None,
-            "profit_points" : None,
             "stoploss":None,
             "exit_timestamp":None,
             "exit_price":None,
+            "profit_points" : None,
             "reason_for_exit":None,
             "options_data":None,
             }
@@ -214,6 +273,7 @@ class RsiLevelsShift(Strategy):
                 self.current_trade["exit_price"] -
                 self.current_trade["entry_price"]
             )
+            
         elif self.current_trade["entry_signal"] == "SELL":
             self.current_trade["profit_points"] = (
                 self.current_trade["entry_price"] -
@@ -231,10 +291,10 @@ class RsiLevelsShift(Strategy):
             self.current_trade["entry_signal"],
             self.current_trade["entry_time"],
             self.current_trade["entry_price"],
-            self.current_trade["profit_points"],
             self.current_trade["stoploss"],
             self.current_trade["exit_timestamp"],
             self.current_trade["exit_price"],
+            self.current_trade["profit_points"],
             self.current_trade["reason_for_exit"],
         ])
         self.current_trade = default_records()
@@ -251,8 +311,6 @@ class RsiLevelsShift(Strategy):
         # 1. Intraday Exit (Square off before market close)
         trade_fill_type = (self.data.signal[-2])
         if  trade_fill_type and (not self.current_trade["entry_price"]):
-            print("current_time == ",current_time)
-            print(trade_fill_type)
             opttype,criteriatype = trade_fill_type.split("_")
             # print(opttype)
             if (trade_fill_type in self.options_side_config):
@@ -262,7 +320,7 @@ class RsiLevelsShift(Strategy):
                 high_breakout = (self.data.Close[-1] > self.data.High[-2])
                 low_breakdown = (self.data.Close[-1] < self.data.Low[-2])
                 # ---------- call-sell,put-buy ----------------
-                if (criteriatype.upper() == "RESISTANCE") and ((is_call and low_breakdown) or (is_put and high_breakout)) :
+                if (criteriatype.upper() == "RESISTANCE") and ((is_call and low_breakdown) or (is_put and low_breakdown)) :
                     self.current_trade["criteria_timestamp"] = self.data.index[-2]
                     self.current_trade["criteria_type"] = criteriatype
                     self.current_trade["option_type"] = opttype
@@ -272,23 +330,32 @@ class RsiLevelsShift(Strategy):
                     self.current_trade["entry_time"] = self.data.index[-1]
                     self.current_trade["expiry_date"] = self.data.expiry[-1]
                     self.current_trade["strike_price"] = parse_strike(self.strike_config, self.data.Close[-1], self.step_size.get(self.symbol, 50))
+                    self.current_trade["stoploss"] = self.data.High[-2]
+                    self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
                     if is_call:
-                        self.current_trade["stoploss"] = self.data.High[-2]
-                        self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
                         ATM_KEY = self.generate_symbol("CE")
                     else:
-                        self.current_trade["stoploss"] = self.data.Low[-2]
-                        self.current_trade["criteria_breakout_price"] = self.data.High[-2]
+                        # self.current_trade["stoploss"] = self.data.Low[-2]
+                        # self.current_trade["criteria_breakout_price"] = self.data.High[-2]
                         ATM_KEY = self.generate_symbol("PE")
 
-                    ATM_DF =  pd.read_csv(os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv",),names=["Date","Time","Open","High","Low","Close","Volume","IO"],index_col=False,parse_dates=[["Date","Time"]])
-                    ATM_DF.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+                    ATM_DF = pd.read_csv(
+                            os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv"),
+                            header=None,
+                            names=["Date","Time","Open","High","Low","Close","Volume","IO"]
+                        )
+
+                    ATM_DF["Datetime"] = pd.to_datetime(
+                            ATM_DF["Date"].astype(str) + " " + ATM_DF["Time"].astype(str),
+                            format="%Y%m%d %H:%M"
+                        )                    
+                    ATM_DF.rename(columns={"Datetime": "timestamp"}, inplace=True)
                     ATM_DF = ATM_DF[ATM_DF["timestamp"].dt.date == self.data.index[-1].date()].sort_values(by="timestamp")
                     self.current_trade["entry_price"] = ATM_DF[ATM_DF["timestamp"] <= self.data.index[-1]].iloc[-1]["Close"]    
                     self.current_trade["options_data"] = ATM_DF
                     return
                 # ---------- call-buy,put-sell ----------------
-                if (criteriatype.upper() == "SUPPORT") and ((is_call and high_breakout) or (is_put and low_breakdown)) :
+                if (criteriatype.upper() == "SUPPORT") and ((is_call and high_breakout) or (is_put and high_breakout)) :
                     self.current_trade["criteria_timestamp"] = self.data.index[-2]
                     self.current_trade["criteria_type"] = criteriatype
                     self.current_trade["option_type"] = opttype
@@ -298,25 +365,33 @@ class RsiLevelsShift(Strategy):
                     self.current_trade["entry_time"] = self.data.index[-1]
                     self.current_trade["expiry_date"] = self.data.expiry[-1]
                     self.current_trade["strike_price"] = parse_strike(self.strike_config, self.data.Close[-1], self.step_size.get(self.symbol, 50))
+                    self.current_trade["stoploss"] = self.data.Low[-2]
+                    self.current_trade["criteria_breakout_price"] = self.data.High[-2]
                     if is_call:
-                        self.current_trade["stoploss"] = self.data.Low[-2]
-                        self.current_trade["criteria_breakout_price"] = self.data.High[-2]
                         ATM_KEY = self.generate_symbol("CE")
-
                     else:
-                        self.current_trade["stoploss"] = self.data.High[-2]
-                        self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
+                        # self.current_trade["stoploss"] = self.data.High[-2]
+                        # self.current_trade["criteria_breakout_price"] = self.data.Low[-2]
                         ATM_KEY = self.generate_symbol("PE")
 
-                    ATM_DF =  pd.read_csv(os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv",),names=["Date","Time","Open","High","Low","Close","Volume","IO"],index_col=False,parse_dates=[["Date","Time"]])
-                    ATM_DF.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+                    ATM_DF = pd.read_csv(
+                            os.path.join(self.OPTIONS_PATH,ATM_KEY+".csv"),
+                            header=None,
+                            names=["Date","Time","Open","High","Low","Close","Volume","IO"]
+                        )
+
+                    ATM_DF["Datetime"] = pd.to_datetime(
+                            ATM_DF["Date"].astype(str) + " " + ATM_DF["Time"].astype(str),
+                            format="%Y%m%d %H:%M"
+                        )                    
+                    ATM_DF.rename(columns={"Datetime": "timestamp"}, inplace=True)
                     ATM_DF = ATM_DF[ATM_DF["timestamp"].dt.date == self.data.index[-1].date()].sort_values(by="timestamp")
                     self.current_trade["entry_price"] = ATM_DF[ATM_DF["timestamp"] <= self.data.index[-1]].iloc[-1]["Close"]    
                     self.current_trade["options_data"] = ATM_DF
                     return
                     
         elif self.current_trade["entry_price"] :
-            if (self.current_trade["entry_signal"] == "BUY"):
+            if (((self.current_trade["entry_signal"] == "BUY") and (self.current_trade["option_type"] == "CALL")) or ((self.current_trade["entry_signal"] == "SELL") and (self.current_trade["option_type"] == "PUT"))):
                 if self.data.Low[-1] < self.current_trade["stoploss"]:
                     ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
                     EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
@@ -344,8 +419,7 @@ class RsiLevelsShift(Strategy):
                     self.current_trade["reason_for_exit"] = "Exittime"
                     self.trade_finished()
 
-                
-            elif (self.current_trade["entry_signal"] == "SELL"):
+            if (((self.current_trade["entry_signal"] == "SELL") and (self.current_trade["option_type"] == "CALL")) or ((self.current_trade["entry_signal"] == "BUY") and (self.current_trade["option_type"] == "PUT"))):
                 if self.data.High[-1] > self.current_trade["stoploss"]:
                     ATM_DF :pd.DataFrame= self.current_trade["options_data"].sort_values(by="timestamp")
                     EXIT_ATM_df = ATM_DF[ATM_DF["timestamp"].dt.time >= self.data.index[-1].time()].iloc[0]["Close"]
@@ -413,8 +487,17 @@ def main(backtest_from_to,csv_file,only_expiry,symbol,OPTIONS_PATH,formated_symb
     # Load 1-min data
     print("Loading data...")
     # df = pd.read_csv(csv_file)
-    df =  pd.read_csv(csv_file,names=["Date","Time","open","high","low","close","volume","io"],index_col=False,parse_dates=[["Date","Time"]])
-    df.rename(columns={"Date_Time": "timestamp"}, inplace=True)
+    df = pd.read_csv(
+        csv_file,
+        header=None,
+        names=["Date","Time","open","high","low","close","volume","io"]
+    )
+
+    df["Datetime"] = pd.to_datetime(
+        df["Date"].astype(str) + " " + df["Time"].astype(str),
+        format="%Y%m%d %H:%M"
+    )
+    df.rename(columns={"Datetime": "timestamp"}, inplace=True)
     df = df[(df["timestamp"] >= backtest_from_to["start_date"]) & (df["timestamp"] <= backtest_from_to["end_date"])]
     # Consolidate to 5-min
     print("Consolidating to 5-min timeframe...")
@@ -457,8 +540,9 @@ def main(backtest_from_to,csv_file,only_expiry,symbol,OPTIONS_PATH,formated_symb
     # Print basic stats
     print("\n--- Backtest Statistics ---")
     # print(stats)
-    trades_df= pd.DataFrame(RsiLevelsShift.signals, columns=[
-        [
+    trades_df = pd.DataFrame(
+        RsiLevelsShift.signals,
+        columns=[
             "criteria_timestamp",
             "criteria_type",
             "criteria_breakout_price",
@@ -469,14 +553,14 @@ def main(backtest_from_to,csv_file,only_expiry,symbol,OPTIONS_PATH,formated_symb
             "entry_signal",
             "ENTRY_TIME",
             "entry_price",
-            "PNL",
             "stoploss",
             "EXIT_TIME",
             "exit_price",
+            "PNL",
             "reason_for_exit",
-            ]
-        ]) 
-
+        ]
+    )
+    # trades_df.to_csv("BK.csv",index=False)
     trades_df['ENTRY_TIME'] = pd.to_datetime(trades_df['ENTRY_TIME'])
     trades_df['EXIT_TIME'] = pd.to_datetime(trades_df['EXIT_TIME'])
     trades_df['month'] = trades_df['EXIT_TIME'].dt.to_period('M')
@@ -532,19 +616,12 @@ def main(backtest_from_to,csv_file,only_expiry,symbol,OPTIONS_PATH,formated_symb
     summary_df = pd.DataFrame(summary_rows)
     final_df = pd.concat([trades_df, summary_df], ignore_index=True)
     final_df.drop(columns=["year","month"],inplace=True)
-    final_df.to_csv("Backtest_df.csv",index=False)
-
-    # # Save trades to CSV
-    # if hasattr(stats, '_trades') and not stats._trades.empty:
-    #     stats._trades.to_csv("triple_conf_trades.csv", index=False)
-    #     print("\nTrades saved to triple_conf_trades.csv")
-    # else:
-    #     print("\nNo trades executed.")
+    final_df.to_csv("BACKTEST_RSI_RANGE_SHIFT.csv",index=False)
 
 if __name__ == "__main__":
     
     kwags = dict(
-    backtest_from_to = {"start_date":datetime(2025,1,1),"end_date":datetime(2025,9,30)},
+    backtest_from_to = {"start_date":datetime(2024,6,1),"end_date":datetime(2024,12,31)},
     symbol = "NIFTY",
     formated_symbols={"NIFTY":"NIFTY 50","SENSEX":"SENSEX","BANKNIFTY":"NIFTY BANK"},
     timeframe = "5min", 
@@ -553,8 +630,8 @@ if __name__ == "__main__":
     strike_config = "ATM",  # "ATM", "ATM+100", "ATM-100" 
     step_size = {"NIFTY":50,"SENSEX":100,"BANKNIFTY":100},
     only_expiry = False,
-    OPTIONS_PATH = "",
-    csv_file = "",
+    OPTIONS_PATH = r"C:\Users\Saikr\Downloads\rohith_02\Rohith Set (1 min)\Jan 2020 to Dec 2024 - NIFTY Spot & Options\NIFTY Options",
+    csv_file = r"C:\Users\Saikr\Downloads\rohith_02\Rohith Set (1 min)\Jan 2020 to Dec 2024 - NIFTY Spot & Options\NIFTY Spot\NIFTY.csv",
     options_levels = {
                 "CALL_level":60,
                 "PUT_level":40
